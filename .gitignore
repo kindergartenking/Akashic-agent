@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Node / frontend build output
+node_modules/
+static/
+dist/
+build/
+
+# Runtime data
+*.db
+*.sqlite3
+*.log
+
+# WorkBuddy project-local data
+.workbuddy/
+
+# OS / editor
+.DS_Store
+Thumbs.db

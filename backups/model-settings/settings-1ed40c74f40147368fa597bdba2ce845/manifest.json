@@ -1,0 +1,6 @@
+{
+  "operation_id": "settings-1ed40c74f40147368fa597bdba2ce845",
+  "config": false,
+  "model_registry": false,
+  "credentials": "model-registry.sqlite3"
+}

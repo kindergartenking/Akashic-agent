@@ -1,0 +1,2 @@
+后端已剥离。此目录仅保留前端、插件面板资源、静态构建产物和接口契约。
+请先阅读 backend-contract.md，再实现 HTTP /api/* 和 WebSocket /ws 服务。

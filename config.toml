@@ -1,0 +1,12 @@
+[runtime]
+workspace = "E:\\Project\\akashic-agent-mine"
+
+[llm]
+registry = "workspace"
+
+[memory]
+enabled = true
+engine = "akasha"
+
+[memory.embedding]
+model_ref = "embedding-f22f23d4294744f1a7ccced6bd995291__b4fe900b8c"

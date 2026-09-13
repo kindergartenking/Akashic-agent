@@ -1,0 +1,111 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+import httpx
+
+from agent.model_runtime.auth.codex import (
+    CODEX_API_BASE,
+    CODEX_CLIENT_VERSION,
+    CodexAuthDriver,
+)
+from agent.model_runtime.errors import AuthenticationError, TransportError
+from agent.model_runtime.types import ModelCapabilities
+
+
+@dataclass(frozen=True)
+class CodexModel:
+    slug: str
+    capabilities: ModelCapabilities
+    input_modalities_known: bool
+
+
+class CodexModelCatalog:
+    def __init__(
+        self,
+        auth: CodexAuthDriver,
+        *,
+        base_url: str = CODEX_API_BASE,
+        client_version: str = CODEX_CLIENT_VERSION,
+    ) -> None:
+        self.auth = auth
+        self.base_url = base_url.rstrip("/")
+        self.client_version = client_version
+
+    async def list_models(self) -> list[CodexModel]:
+        headers = await _auth_headers(self.auth)
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(
+                f"{self.base_url}/models",
+                params={"client_version": self.client_version},
+                headers=headers,
+            )
+        if response.status_code == 401:
+            headers = await _auth_headers(self.auth, force_refresh=True)
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.get(
+                    f"{self.base_url}/models",
+                    params={"client_version": self.client_version},
+                    headers=headers,
+                )
+        if response.status_code in {401, 403}:
+            raise AuthenticationError("Codex 模型目录认证失败，请重新登录")
+        if response.status_code >= 400:
+            raise TransportError(f"Codex 模型目录请求失败 (HTTP {response.status_code})")
+        payload = response.json()
+        raw_models = payload.get("models") if isinstance(payload, dict) else None
+        if not isinstance(raw_models, list):
+            raise TransportError("Codex 模型目录响应缺少 models 数组")
+        result: list[CodexModel] = []
+        for raw in raw_models:
+            model = self._parse_model(raw)
+            if raw.get("visibility", "list") == "list" and raw.get("supported_in_api", True) is not False:
+                result.append(model)
+        return result
+
+    @staticmethod
+    def _parse_model(raw: Any) -> CodexModel:
+        if not isinstance(raw, dict) or not isinstance(raw.get("slug"), str):
+            raise TransportError("Codex 模型目录包含无效模型项")
+        context_window = raw.get("context_window") or raw.get("max_context_window")
+        if not isinstance(context_window, int) or context_window <= 0:
+            raise TransportError(f"模型 {raw['slug']} 缺少有效 context_window")
+        max_context_window = raw.get("max_context_window") or context_window
+        if not isinstance(max_context_window, int) or max_context_window < context_window:
+            raise TransportError(f"模型 {raw['slug']} 的 max_context_window 无效")
+        modalities = raw.get("input_modalities")
+        modalities_known = isinstance(modalities, list)
+        parsed_modalities = tuple(str(item) for item in modalities) if isinstance(modalities, list) else ("text",)
+        efforts = raw.get("supported_reasoning_levels") or []
+        effort_names = tuple(
+            str(item.get("effort"))
+            for item in efforts
+            if isinstance(item, dict) and item.get("effort")
+        )
+        return CodexModel(
+            slug=raw["slug"],
+            capabilities=ModelCapabilities(
+                context_window=context_window,
+                max_output_tokens=0,
+                max_context_window=max_context_window,
+                supported_reasoning_efforts=effort_names,
+                default_reasoning_effort=raw.get("default_reasoning_level"),
+                input_modalities=parsed_modalities,
+                supports_parallel_tool_calls=bool(raw.get("supports_parallel_tool_calls")),
+                supports_reasoning_summaries=bool(
+                    raw.get(
+                        "supports_reasoning_summary_parameter",
+                        raw.get("supports_reasoning_summaries", False),
+                    )
+                ),
+                use_responses_lite=bool(raw.get("use_responses_lite")),
+            ),
+            input_modalities_known=modalities_known,
+        )
+
+
+async def _auth_headers(auth: CodexAuthDriver, *, force_refresh: bool = False) -> dict[str, str]:
+    import asyncio
+
+    return await asyncio.to_thread(auth.headers, force_refresh=force_refresh)
