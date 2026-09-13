@@ -101,7 +101,7 @@ async def check_1_phases_build() -> None:
         ("before_step", default_before_step_modules(bus)),
         ("after_step", default_after_step_modules(bus)),
         ("after_reasoning", default_after_reasoning_modules(bus, services)),
-        ("after_turn", default_after_turn_modules(bus, outbound, ctx)),
+        ("after_turn", default_after_turn_modules(bus, outbound)),
     ]
     for name, chain in modules:
         check(f"  {name} 模块链非空", len(chain) > 0, f"len={len(chain)}")

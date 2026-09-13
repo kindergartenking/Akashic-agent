@@ -264,7 +264,7 @@ async def _test_full_turn() -> None:
     await bus.emit(BeforeStepCtx("s", "cli", "c", 0, 100, None))
     await bus.observe(AfterStepCtx("s", "cli", "c", 0, 100, ("web_search",), "", ("web_search",), (), None, True))
 
-    ar = await bus.emit(AfterReasoningCtx("s", "cli", "c", ("web_search",), None, None, False, (), {}, "raw reply"))
+    ar = await bus.emit(AfterReasoningCtx("s", "cli", "c", ("web_search",), None, None, False, (), "raw reply"))
     check("after_reasoning GATE 改写 reply", ar.reply == "raw reply [polished]", f"got={ar.reply!r}")
 
     await bus.observe(AfterTurnCtx("s", "cli", "c", ar.reply, ("web_search",), None, True))

@@ -1,243 +1,110 @@
+"""after_turn 阶段（6 模块已完整）。
+
+after_turn 是 7 阶段生命周期的第七个阶段（turn 层 · TAP），位于 after_reasoning 之后，
+是**一次 turn 的最后一步**。完整职责是「提交事件 + 派发 outbound + 广播快照」。
+
+  build_committed → fanout_committed → build_ctx → fanout_ctx → dispatch → return
+
+  · build_committed —— 组装 TurnCommitted（turn 权威终结事件）。
+  · fanout_committed —— 广播 TurnCommitted（内部系统消费）。
+  · build_ctx —— 组装 AfterTurnCtx（@on_after_turn 插件的 TAP 快照）。
+  · fanout_ctx —— 广播 AfterTurnCtx（插件旁路观察）。
+  · dispatch —— 把 outbound 真正派发出去。
+  · return —— 把 outbound 设为阶段 output（整个 turn pipeline 的最终产物）。
+
+本阶段三个独特之处：
+1. 是 TAP 阶段，但**有 build_ctx**——input 是 TurnSnapshot 三元组，不是 AfterTurnCtx，
+   需组装出快照；这与 after_step（input 就是快照，copy 即可）不同。
+2. **双层广播**：fanout 两个东西——TurnCommitted（内部权威提交事件，heavy）+
+   AfterTurnCtx（插件 TAP 快照，light）。
+3. output 是 OutboundMessage（整个 turn pipeline 的最终产物），不是 ctx。
+
+裁剪说明（相对 M1b 旧版 10 模块 ~400 行）：
+- 砍 build_work（budget / react_stats / model_binding 计算）；
+- 砍 collect_extras（turn:extra:）、log_budget（日志）、collect_telemetry（turn:telemetry:）；
+- TurnCommitted 事件类型砍到 8 个核心字段；
+- 删掉对已裁剪字段 context_retry / meme_tag 的 3 处引用。
+"""
+
 from __future__ import annotations
 
-import asyncio
-import copy
-from dataclasses import dataclass, replace
-import logging
-from time import perf_counter
-from typing import TYPE_CHECKING, Any, TypeAlias, cast
+from dataclasses import dataclass
+from typing import TypeAlias, cast
 
-from agent.core.passive_support import (
-    build_post_reply_context_budget,
-    extract_react_stats,
-    log_post_reply_context_budget,
-    log_react_context_budget,
-)
-from agent.control.context import running_turn_id
-from agent.control.ports import InputLock
-from agent.core.types import to_tool_call_groups
 from agent.lifecycle.phase import (
     PhaseFrame,
     PhaseModule,
-    collect_prefixed_slots,
     topo_sort_modules,
 )
-from agent.lifecycle.types import AfterTurnCtx, TurnPersistencePolicy, TurnSnapshot
-from agent.model_runtime.registry import current_model_binding
+from agent.lifecycle.types import AfterTurnCtx, TurnSnapshot
 from agent.turns.outbound import OutboundDispatch, OutboundPort
 from bus.event_bus import EventBus
 from bus.events import OutboundMessage
 from bus.events_lifecycle import TurnCommitted
-from core.common.diagnostic_log import turn_milestone
-from core.error_context import current_client_message_id, current_session_key
-
-if TYPE_CHECKING:
-    from agent.context import ContextBuilder
-    from session.manager import Session
-
-logger = logging.getLogger(__name__)
-
-
-def _milestone(
-    logger: logging.Logger,
-    event: str,
-    *,
-    duration_ms: float | None = None,
-    counts: str = "",
-    outcome: str = "",
-    level: int = logging.INFO,
-) -> None:
-    """打一个 turn 尾里程碑；身份统一从 contextvar 读取，字段全部走 turn_milestone。"""
-
-    turn_milestone(
-        logger,
-        event,
-        session_id=current_session_key.get() or "",
-        turn_id=running_turn_id.get(),
-        client_message_id=current_client_message_id.get(),
-        duration_ms=duration_ms,
-        counts=counts,
-        outcome=outcome,
-        level=level,
-    )
 
 
 @dataclass
 class AfterTurnFrame(PhaseFrame[TurnSnapshot, OutboundMessage]):
+    """after_turn 的帧：input = TurnSnapshot（三元组），output = OutboundMessage。"""
+
     pass
 
 
 AfterTurnModules: TypeAlias = list[PhaseModule[AfterTurnFrame]]
 
 
-_BUDGET_SLOT = "turn:budget"
-_REACT_STATS_SLOT = "turn:react_stats"
-_TOOL_CHAIN_SLOT = "turn:tool_chain"
-_PERSISTENCE_SLOT = "turn:persistence"
-_EXTRA_SLOT = "turn:extra"
-_EXTRA_COLLECTED_SLOT = "turn:extra_collected"
 _TURN_COMMITTED_SLOT = "turn:committed"
 _CTX_SLOT = "turn:ctx"
-_EXTRA_PREFIX = "turn:extra:"
-_TELEMETRY_PREFIX = "turn:telemetry:"
-
-
-class _BuildTurnWorkModule:
-    slot = "after_turn.build_work"
-    requires: tuple[str, ...] = ()
-
-    def __init__(
-        self,
-        context: ContextBuilder,
-    ) -> None:
-        self._context = context
-
-    produces = (
-        _BUDGET_SLOT,
-        _REACT_STATS_SLOT,
-        _TOOL_CHAIN_SLOT,
-        _PERSISTENCE_SLOT,
-        _EXTRA_SLOT,
-    )
-
-    async def run(self, frame: AfterTurnFrame) -> AfterTurnFrame:
-        snap = frame.input
-        state = snap.state
-        msg = state.msg
-        raw_session = state.session
-        if raw_session is None:
-            raise RuntimeError("AfterTurn requires TurnState.session")
-        session = cast("Session", raw_session)
-        canonical_history = [
-            message for unit in session.history_units() for message in unit.messages
-        ]
-        frame.slots[_BUDGET_SLOT] = build_post_reply_context_budget(
-            context=self._context,
-            history=canonical_history,
-        )
-        frame.slots[_REACT_STATS_SLOT] = extract_react_stats(snap.ctx.context_retry)
-        extra: dict[str, object] = (
-            {"skip_post_memory": True}
-            if (msg.metadata or {}).get("skip_post_memory")
-            else {}
-        )
-        binding = current_model_binding()
-        if binding is not None:
-            extra["model_binding"] = binding.describe("agent")
-        frame.slots[_EXTRA_SLOT] = extra
-        frame.slots[_TOOL_CHAIN_SLOT] = list(snap.ctx.tool_chain)
-        frame.slots[_PERSISTENCE_SLOT] = state.persistence
-        return frame
 
 
 class _BuildTurnCommittedModule:
-    requires = (
-        "after_turn.collect_extras",
-        _BUDGET_SLOT,
-        _REACT_STATS_SLOT,
-        _TOOL_CHAIN_SLOT,
-        _PERSISTENCE_SLOT,
-        _EXTRA_SLOT,
-        _EXTRA_COLLECTED_SLOT,
-    )
+    """build_committed：组装 TurnCommitted（turn 权威终结事件）。
+
+    - slot     ：after_turn.build_committed；
+    - requires ：无依赖（链上第一个模块）；
+    - produces ：turn:committed；
+    - run      ：从 input（TurnSnapshot）提取核心字段组装 TurnCommitted——input 是用户
+      输入、assistant_response 是回复、tools_used 是工具、assistant_message_id 是持久化
+      稳定 ID、timestamp 是提交时间。
+
+    这是「提交事件」的落点。相对旧版砍掉 budget / react_stats / meme_tag / model_binding /
+    tool_call_groups 等扩展字段，只填核心语义。
+
+    本模块不设 frame.output——output 由链尾的 return 模块产出。
+    """
+
     slot = "after_turn.build_committed"
+    requires: tuple[str, ...] = ()
     produces = (_TURN_COMMITTED_SLOT,)
 
     async def run(self, frame: AfterTurnFrame) -> AfterTurnFrame:
         snap = frame.input
         state = snap.state
         msg = state.msg
-        tool_chain_list = cast(list[dict[str, Any]], frame.slots[_TOOL_CHAIN_SLOT])
-        persistence = cast(TurnPersistencePolicy, frame.slots[_PERSISTENCE_SLOT])
-        raw_react_stats = snap.ctx.context_retry.get("react_stats")
-        raw_model_usage = (
-            raw_react_stats.get("model_usage")
-            if isinstance(raw_react_stats, dict)
-            else None
-        )
-        raw_user_message_id = snap.outbound.metadata.get("persisted_user_message_id")
-        raw_user_message_ids = snap.outbound.metadata.get("persisted_user_message_ids")
-        persisted_user_message_ids = (
-            tuple(cast(list[str], raw_user_message_ids))
-            if isinstance(raw_user_message_ids, list)
-            and all(isinstance(item, str) and item for item in raw_user_message_ids)
-            else ()
-        )
-        raw_source = msg.metadata.get("_control_turn_input_source")
-        input_messages = [msg.content]
-        skip_post_memory = (msg.metadata or {}).get("skip_post_memory") is True
-        if raw_source is not None:
-            inputs = cast(InputLock, raw_source).used_inputs()
-            input_messages = [item.content for item in inputs]
-            skip_post_memory = any(
-                item.metadata.get("skip_post_memory") is True for item in inputs
-            )
-        aggregate_input = "\n\n".join(input_messages)
-        extra = dict(cast(dict[str, object], frame.slots[_EXTRA_SLOT]))
-        if skip_post_memory:
-            extra["skip_post_memory"] = True
         frame.slots[_TURN_COMMITTED_SLOT] = TurnCommitted(
             session_key=state.session_key,
             channel=msg.channel,
             chat_id=msg.chat_id,
-            input_message=aggregate_input,
-            persisted_user_message=(
-                aggregate_input if persistence.persist_user else None
-            ),
+            input_message=msg.content,
             assistant_response=snap.ctx.reply,
             tools_used=list(snap.ctx.tools_used),
-            turn_id=running_turn_id.get(),
-            client_message_id=current_client_message_id.get(),
-            persisted_user_message_id=(
-                raw_user_message_id
-                if isinstance(raw_user_message_id, str) and raw_user_message_id
-                else None
-            ),
-            persisted_user_message_ids=persisted_user_message_ids,
             assistant_message_id=snap.outbound.session_message_id,
-            thinking=snap.ctx.thinking,
-            raw_reply=snap.ctx.response_metadata.raw_text,
-            meme_tag=snap.ctx.meme_tag,
-            meme_media_count=len(snap.ctx.media),
-            tool_chain_raw=copy.deepcopy(tool_chain_list),
-            tool_call_groups=to_tool_call_groups(tool_chain_list),
             timestamp=msg.timestamp,
-            post_reply_budget=dict(cast(dict[str, int], frame.slots[_BUDGET_SLOT])),
-            react_stats=dict(cast(dict[str, int], frame.slots[_REACT_STATS_SLOT])),
-            extra=extra,
-            model_usage=(
-                dict(raw_model_usage) if isinstance(raw_model_usage, dict) else {}
-            ),
-            model_binding=_model_binding_from_extra(frame.slots[_EXTRA_SLOT]),
         )
         return frame
 
 
-def _model_binding_from_extra(value: object) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise TypeError("after_turn extra 不是 dict")
-    raw = value.get("model_binding")
-    if raw is None:
-        return {}
-    if not isinstance(raw, dict):
-        raise TypeError("after_turn model_binding 不是 dict")
-    return {str(key): item for key, item in raw.items()}
-
-
-class _CollectAfterTurnExtraSlotsModule:
-    slot = "after_turn.collect_extras"
-    requires = ("after_turn.build_work", _EXTRA_SLOT)
-    produces = (_EXTRA_SLOT, _EXTRA_COLLECTED_SLOT)
-
-    async def run(self, frame: AfterTurnFrame) -> AfterTurnFrame:
-        extra = dict(cast(dict[str, object], frame.slots[_EXTRA_SLOT]))
-        extra.update(collect_prefixed_slots(frame.slots, _EXTRA_PREFIX))
-        frame.slots[_EXTRA_SLOT] = extra
-        frame.slots[_EXTRA_COLLECTED_SLOT] = True
-        return frame
-
-
 class _FanoutTurnCommittedModule:
+    """fanout_committed：广播 TurnCommitted 给内部系统（记忆 / 统计）。
+
+    - slot     ：after_turn.fanout_committed；
+    - requires ：after_turn.build_committed + turn:committed；
+    - produces ：无（旁路广播，不产数据槽）；
+    - run      ：await bus.fanout(committed)。
+
+    本模块不设 frame.output——output 由链尾的 return 模块产出。
+    """
+
     slot = "after_turn.fanout_committed"
     requires = ("after_turn.build_committed", _TURN_COMMITTED_SLOT)
 
@@ -246,55 +113,22 @@ class _FanoutTurnCommittedModule:
 
     async def run(self, frame: AfterTurnFrame) -> AfterTurnFrame:
         committed = cast(TurnCommitted, frame.slots[_TURN_COMMITTED_SLOT])
-        _milestone(logger, "after_turn.turn_committed_fanout.start")
-        fanout_started = perf_counter()
-        try:
-            await self._bus.fanout(committed)
-        except asyncio.CancelledError:
-            _milestone(
-                logger,
-                "after_turn.turn_committed_fanout.cancelled",
-                duration_ms=(perf_counter() - fanout_started) * 1000,
-                outcome="cancelled",
-                level=logging.WARNING,
-            )
-            raise
-        except Exception:
-            _milestone(
-                logger,
-                "after_turn.turn_committed_fanout.error",
-                duration_ms=(perf_counter() - fanout_started) * 1000,
-                outcome="error",
-                level=logging.ERROR,
-            )
-            raise
-        _milestone(
-            logger,
-            "after_turn.turn_committed_fanout.returned",
-            duration_ms=(perf_counter() - fanout_started) * 1000,
-            outcome="returned",
-        )
-        return frame
-
-
-class _LogBudgetModule:
-    slot = "after_turn.log_budget"
-    requires = ("after_turn.build_work", _BUDGET_SLOT, _REACT_STATS_SLOT)
-
-    async def run(self, frame: AfterTurnFrame) -> AfterTurnFrame:
-        state = frame.input.state
-        log_post_reply_context_budget(
-            session_key=state.session_key,
-            budget=cast(dict[str, int], frame.slots[_BUDGET_SLOT]),
-        )
-        log_react_context_budget(
-            session_key=state.session_key,
-            react_stats=cast(dict[str, int], frame.slots[_REACT_STATS_SLOT]),
-        )
+        await self._bus.fanout(committed)
         return frame
 
 
 class _BuildAfterTurnCtxModule:
+    """build_ctx：组装 AfterTurnCtx（@on_after_turn 插件的 TAP 快照）。
+
+    - slot     ：after_turn.build_ctx；
+    - requires ：after_turn.fanout_committed；
+    - produces ：turn:ctx；
+    - run      ：从 TurnSnapshot 组装 AfterTurnCtx——reply / tools_used / thinking 是快照
+      内容，will_dispatch 标记是否随后派发（Tap handler 运行时 dispatch 尚未发生）。
+
+    本模块不设 frame.output——output 由链尾的 return 模块产出。
+    """
+
     slot = "after_turn.build_ctx"
     requires = ("after_turn.fanout_committed",)
     produces = (_CTX_SLOT,)
@@ -315,8 +149,18 @@ class _BuildAfterTurnCtxModule:
 
 
 class _FanoutAfterTurnCtxModule:
+    """fanout_ctx：广播 AfterTurnCtx 给 @on_after_turn 插件（TAP 只读）。
+
+    - slot     ：after_turn.fanout_ctx；
+    - requires ：after_turn.build_ctx + turn:ctx；
+    - produces ：无（旁路广播，不产数据槽）；
+    - run      ：await bus.fanout(ctx)。
+
+    本模块不设 frame.output——output 由链尾的 return 模块产出。
+    """
+
     slot = "after_turn.fanout_ctx"
-    requires = ("after_turn.collect_telemetry", _CTX_SLOT)
+    requires = ("after_turn.build_ctx", _CTX_SLOT)
 
     def __init__(self, bus: EventBus) -> None:
         self._bus = bus
@@ -326,22 +170,20 @@ class _FanoutAfterTurnCtxModule:
         return frame
 
 
-class _CollectAfterTurnTelemetrySlotsModule:
-    slot = "after_turn.collect_telemetry"
-    requires = ("after_turn.build_ctx", _CTX_SLOT)
-    produces = (_CTX_SLOT,)
-
-    async def run(self, frame: AfterTurnFrame) -> AfterTurnFrame:
-        ctx = cast(AfterTurnCtx, frame.slots[_CTX_SLOT])
-        extra_metadata = dict(ctx.extra_metadata)
-        extra_metadata.update(collect_prefixed_slots(frame.slots, _TELEMETRY_PREFIX))
-        frame.slots[_CTX_SLOT] = replace(ctx, extra_metadata=extra_metadata)
-        return frame
-
-
 class _DispatchOutboundModule:
+    """dispatch：把 outbound 真正派发出去。
+
+    - slot     ：after_turn.dispatch；
+    - requires ：after_turn.fanout_ctx；
+    - produces ：无（副作用，直接调 OutboundPort.dispatch）；
+    - run      ：若 state.dispatch_outbound，把 OutboundMessage 投影为 OutboundDispatch
+      交给 outbound 端口派发。
+
+    这是「派发 outbound」的落点。本模块不设 frame.output——output 由链尾的 return 产出。
+    """
+
     slot = "after_turn.dispatch"
-    requires = ("after_turn.fanout_ctx", _CTX_SLOT)
+    requires = ("after_turn.fanout_ctx",)
 
     def __init__(self, outbound: OutboundPort) -> None:
         self._outbound = outbound
@@ -366,6 +208,16 @@ class _DispatchOutboundModule:
 
 
 class _ReturnOutboundMessageModule:
+    """return：把 outbound 设为阶段 output（整个 turn pipeline 的最终产物）。
+
+    - slot     ：after_turn.return；
+    - requires ：after_turn.dispatch；
+    - run      ：frame.output = frame.input.outbound。
+
+    本模块是 after_turn 的链尾，也是 7 阶段生命周期的终点——output 是 OutboundMessage，
+    turn_pipeline.run() 最终返回它。
+    """
+
     slot = "after_turn.return"
     requires = ("after_turn.dispatch",)
 
@@ -377,17 +229,13 @@ class _ReturnOutboundMessageModule:
 def default_after_turn_modules(
     bus: EventBus,
     outbound: OutboundPort,
-    context: ContextBuilder,
     plugin_modules: AfterTurnModules | None = None,
 ) -> AfterTurnModules:
+    """装配 after_turn 的内置模块链（build_committed → fanout_committed → build_ctx → fanout_ctx → dispatch → return）。"""
     builtins: AfterTurnModules = [
-        _BuildTurnWorkModule(context),
-        _CollectAfterTurnExtraSlotsModule(),
         _BuildTurnCommittedModule(),
         _FanoutTurnCommittedModule(bus),
-        _LogBudgetModule(),
         _BuildAfterTurnCtxModule(),
-        _CollectAfterTurnTelemetrySlotsModule(),
         _FanoutAfterTurnCtxModule(bus),
         _DispatchOutboundModule(outbound),
         _ReturnOutboundMessageModule(),

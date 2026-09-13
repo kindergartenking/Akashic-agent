@@ -111,7 +111,7 @@ GATE 阶段的后三段 `emit → collect_exports → return` 是**稳定骨架*
 | prompt_render | `PromptRenderInput`（frozen） | `PromptRenderResult`（frozen） |
 | before_step | `BeforeStepInput`（frozen） | `BeforeStepCtx` |
 | after_step | `AfterStepCtx`（frozen 快照） | `AfterStepCtx`（frozen，补过 telemetry） |
-| after_reasoning | `AfterReasoningInput`（frozen） | `AfterReasoningCtx` |
+| after_reasoning | `AfterReasoningInput`（frozen） | `TurnSnapshot`（state + outbound + ctx 三元组） |
 | after_turn | `TurnSnapshot` | `AfterTurnCtx`（frozen） |
 
 ---
@@ -203,22 +203,50 @@ copy_input → collect_pre → fanout → collect_post → return
 > 并发广播，返回值丢弃、失败只计数）；collect 模块被实例化两次（collect_pre / collect_post）夹住 fanout；
 > AfterStepCtx 是 frozen，补 telemetry 用 dataclasses.replace 生成新实例，而非原地改字段。
 
-### 4.6 after_reasoning ⏳（旧版偏重 ~500 行，待按「基本功能」裁剪）
+### 4.6 after_reasoning ✅（GATE）
 
 ```
-build_ctx → emit → persist_user → persist_asst → update_meta → append_messages → build_outbound → return
+build_ctx → emit → persist → build_outbound → return
 ```
 
-裁剪指引：基本功能 = 解析回复 + 持久化 + 组 outbound + 可改 reply；
-可砍 = context_retry、meme_tag、retired 字段保护、budget/react_stats、persist 字段扩展等。
+| 模块 | requires | produces | 职责 |
+|---|---|---|---|
+| build_ctx | — | `reasoning:ctx` | `parse_response` 解析回复 + 组装 AfterReasoningCtx |
+| emit | `after_reasoning.build_ctx`, `reasoning:ctx` | `reasoning:ctx` | `bus.emit(ctx)` 门控，插件可改 reply / media / outbound_metadata |
+| persist | `after_reasoning.emit`, `reasoning:ctx` | `reasoning:persisted_user` + `reasoning:persisted_assistant` | user + assistant 消息落库（合并原 persist_user / persist_asst / update_meta / append_messages） |
+| build_outbound | `after_reasoning.persist`, `reasoning:ctx` | `reasoning:outbound` | 组装 OutboundMessage，回填 persisted 稳定 ID |
+| return | `after_reasoning.build_outbound`, `reasoning:ctx`, `reasoning:outbound` | — | 打包 TurnSnapshot(state, outbound, ctx) |
 
-### 4.7 after_turn ⏳（旧版偏重 ~400 行，待裁剪）
+> 独特之处：是最后一个 GATE（插件可在回复发出前改 reply / media / outbound_metadata）；
+> output 是 TurnSnapshot 三元组，不是单个 ctx；与 before_reasoning 共享 reasoning: 命名空间（一条链两端）。
+>
+> 裁剪说明（相对 M1b 旧版 8 模块 ~500 行）：砍 context_retry / meme_tag 字段、mobile 特判、
+> control turn 多输入回放（InputLock）、milestone 诊断日志、retired 字段保护、persist 字段扩展；
+> 四个持久化步骤合并为一个 persist。
+
+### 4.7 after_turn ✅（TAP）
 
 ```
-build_work → build_committed → collect_extras → fanout_committed → log_budget → build_ctx → fanout_ctx → collect_telemetry → dispatch → return
+build_committed → fanout_committed → build_ctx → fanout_ctx → dispatch → return
 ```
 
-裁剪指引：基本功能 = 提交事件 + 派发 outbound；可砍 = log_budget、collect_telemetry、milestone 诊断日志等。
+| 模块 | requires | produces | 职责 |
+|---|---|---|---|
+| build_committed | — | `turn:committed` | 组装 TurnCommitted（提交事件，核心字段） |
+| fanout_committed | `after_turn.build_committed`, `turn:committed` | —（旁路） | `bus.fanout(committed)` 广播提交事件 |
+| build_ctx | `after_turn.fanout_committed` | `turn:ctx` | 组装 AfterTurnCtx（插件 TAP 快照） |
+| fanout_ctx | `after_turn.build_ctx`, `turn:ctx` | —（旁路） | `bus.fanout(ctx)` 广播快照 |
+| dispatch | `after_turn.fanout_ctx` | —（副作用） | `OutboundPort.dispatch` 派发 outbound |
+| return | `after_turn.dispatch` | — | 设 frame.output = OutboundMessage |
+
+> 独特之处：TAP 阶段但有 build_ctx（input 是 TurnSnapshot 三元组，需组装出 AfterTurnCtx，
+> 不同于 after_step 的 copy_input）；**双层广播**（TurnCommitted 内部权威事件 + AfterTurnCtx 插件快照）；
+> output 是 OutboundMessage（整个 turn pipeline 的最终产物）。
+>
+> 裁剪说明（相对 M1b 旧版 10 模块 ~400 行）：砍 build_work（budget/react_stats/model_binding）、
+> collect_extras（turn:extra:）、log_budget（日志）、collect_telemetry（turn:telemetry:）；
+> TurnCommitted 事件类型砍到 8 核心字段（session_key/channel/chat_id/input_message/
+> assistant_response/tools_used/assistant_message_id/timestamp）。
 
 ---
 
@@ -231,11 +259,12 @@ build_work → build_committed → collect_extras → fanout_committed → log_b
 | prompt_render | ✅ 已重建（5 模块） | return 端到端全绿（6 断言） |
 | before_step | ✅ 已重建（5 模块） | return 端到端全绿（8 断言） |
 | after_step | ✅ 已重建（5 实例） | return 端到端全绿（9 断言） |
-| after_reasoning | ⏳ 旧版（M1b，偏重） | 待裁剪重建 |
-| after_turn | ⏳ 旧版（M1b，偏重） | 待裁剪重建 |
+| after_reasoning | ✅ 已重建（5 模块） | return 端到端全绿（11 断言） |
+| after_turn | ✅ 已重建（6 模块） | return 端到端全绿（14 断言） |
 
-> `turn_pipeline.run()` 目前只接回 `before_turn`；prompt_render 已在 `reasoner.run_turn()` 里装配并执行
-> （Phase 3），其余阶段随逐个 phase 重建逐步接回。
+> `turn_pipeline.run()` 已接回完整 7 阶段链路（before_turn → before_reasoning → reasoner →
+> after_reasoning → after_turn），一次 turn 端到端跑通；m2_verify 22/22 全绿（顺序、step 循环、
+> GATE 改写、abort/early_stop 短路、TurnCommitted fanout、dispatch 全部验证通过）。
 
 ---
 

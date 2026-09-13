@@ -194,11 +194,9 @@ class AfterReasoningCtx:
     response_metadata: ResponseMetadata
     streamed: bool
     tool_chain: tuple[dict[str, Any], ...]
-    context_retry: dict[str, object]
     # 可写
     reply: str
     media: list[str] = field(default_factory=_empty_str_list)
-    meme_tag: str | None = None
     outbound_metadata: dict[str, Any] = field(default_factory=_empty_metadata)
 
 

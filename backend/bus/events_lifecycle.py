@@ -2,10 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Literal
-
-if TYPE_CHECKING:
-    from agent.core.types import ToolCallGroup
+from typing import Any, Literal
 
 
 # 插件事件接口：现有插件订阅下列事件并读取其字段。核心重构可以转换事件，
@@ -49,32 +46,21 @@ class TurnOutputCompleted:
 
 @dataclass(frozen=True)
 class TurnCommitted:
+    """turn 提交的权威终结事件（裁剪后核心字段）。
+
+    相对 M1b 旧版（20+ 字段）砍掉 persisted_*、thinking、raw_reply、meme_*、
+    tool_chain_raw、tool_call_groups、post_reply_budget、react_stats、extra、
+    model_usage、model_binding 等重型扩展字段，只保留提交事件的最小语义。
+    """
+
     session_key: str
     channel: str
     chat_id: str
     input_message: str
-    persisted_user_message: str | None
     assistant_response: str
     tools_used: list[str]
-    turn_id: str = ""
-    client_message_id: str = ""
-    persisted_user_message_id: str | None = None
-    persisted_user_message_ids: tuple[str, ...] = ()
     assistant_message_id: str | None = None
-    thinking: str | None = None
-    raw_reply: str | None = None
-    meme_tag: str | None = None
-    meme_media_count: int | None = None
-    tool_chain_raw: list[dict[str, Any]] = field(default_factory=list[dict[str, Any]])
-    tool_call_groups: list["ToolCallGroup"] = field(
-        default_factory=list["ToolCallGroup"]
-    )
     timestamp: datetime | None = None
-    post_reply_budget: dict[str, int] = field(default_factory=dict[str, int])
-    react_stats: dict[str, int] = field(default_factory=dict[str, int])
-    extra: dict[str, Any] = field(default_factory=dict[str, Any])
-    model_usage: dict[str, Any] = field(default_factory=dict[str, Any])
-    model_binding: dict[str, Any] = field(default_factory=dict[str, Any])
 
 
 @dataclass(frozen=True)
