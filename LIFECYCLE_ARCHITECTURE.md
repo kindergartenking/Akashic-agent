@@ -110,7 +110,7 @@ GATE 阶段的后三段 `emit → collect_exports → return` 是**稳定骨架*
 | before_reasoning | `BeforeReasoningInput`（frozen） | `BeforeReasoningCtx` |
 | prompt_render | `PromptRenderInput`（frozen） | `PromptRenderResult`（frozen） |
 | before_step | `BeforeStepInput`（frozen） | `BeforeStepCtx` |
-| after_step | 快照 | `AfterStepCtx`（frozen） |
+| after_step | `AfterStepCtx`（frozen 快照） | `AfterStepCtx`（frozen，补过 telemetry） |
 | after_reasoning | `AfterReasoningInput`（frozen） | `AfterReasoningCtx` |
 | after_turn | `TurnSnapshot` | `AfterTurnCtx`（frozen） |
 
@@ -168,17 +168,40 @@ build_ctx → emit → collect_exports → render → return
 > 关键差异：output 不是 ctx 而是 `PromptRenderResult`（messages），因此多一个 `render` 模块，
 > 且排在 collect_exports 之后（render 要用收好的完整 ctx 渲染）。
 
-### 4.4 before_step ⏳
+### 4.4 before_step ✅
 
 ```
-build_ctx → emit → inject_hints → collect_exports → return
+build_ctx → emit → collect_exports → inject_hints → return
 ```
 
-### 4.5 after_step ⏳（TAP）
+| 模块 | requires | produces | 职责 |
+|---|---|---|---|
+| build_ctx | — | `step:ctx` | 组装 BeforeStepCtx（iteration + token 估算 + 可见工具转 frozenset） |
+| emit | `before_step.build_ctx`, `step:ctx` | `step:ctx` | `bus.emit(ctx)` 门控 |
+| collect_exports | `before_step.emit`, `step:ctx` | `step:ctx` | 回收 `step:extra_hint:` + `step:abort_reply`（映射为 early_stop） |
+| inject_hints | `before_step.collect_exports`, `step:ctx` | —（副作用） | 把 hints 塞进 `frame.input.messages` |
+| return | `before_step.inject_hints`, `step:ctx` | — | 设 frame.output = BeforeStepCtx |
+
+> 独特之处：inject_hints 是「副作用型业务模块」（改 frame.input.messages，不产 slot）；
+> early_stop 用 `step:abort_reply` 槽（后缀统一）内部映射，只终止 tool loop 而非整个 turn。
+
+### 4.5 after_step ✅（TAP）
 
 ```
-copy_input → fanout → return
+copy_input → collect_pre → fanout → collect_post → return
 ```
+
+| 模块 | requires | produces | 职责 |
+|---|---|---|---|
+| copy_input | — | `step:ctx` | 把 input 快照（AfterStepCtx）原样放进 step:ctx |
+| collect_pre | `after_step.copy_input`, `step:ctx` | `step:ctx` | fanout 前回收 `step:telemetry:` 合并进 extra_metadata |
+| fanout | `after_step.collect_pre`, `step:ctx` | —（旁路） | `bus.fanout(ctx)` 并发广播给所有 `@on_after_step` / `@on_any` 观察者 |
+| collect_post | `after_step.fanout`, `step:ctx` | `step:ctx` | fanout 后回收补充的 telemetry（不覆盖观察者已见同名） |
+| return | `after_step.collect_post`, `step:ctx` | — | 设 frame.output = AfterStepCtx |
+
+> 独特之处：TAP 阶段没有 build_ctx（input 本身就是 AfterStepCtx 快照，copy 即可）、没有 emit（用 fanout
+> 并发广播，返回值丢弃、失败只计数）；collect 模块被实例化两次（collect_pre / collect_post）夹住 fanout；
+> AfterStepCtx 是 frozen，补 telemetry 用 dataclasses.replace 生成新实例，而非原地改字段。
 
 ### 4.6 after_reasoning ⏳（旧版偏重 ~500 行，待按「基本功能」裁剪）
 
@@ -206,8 +229,8 @@ build_work → build_committed → collect_extras → fanout_committed → log_b
 | before_turn | ✅ 已重建（5 模块） | 5 个独立测试全绿 |
 | before_reasoning | ✅ 已重建（5 模块） | sync_tools + return 端到端全绿 |
 | prompt_render | ✅ 已重建（5 模块） | return 端到端全绿（6 断言） |
-| before_step | ⏳ 旧版（M1b） | 待重建 |
-| after_step | ⏳ 旧版（M1b） | 待重建 |
+| before_step | ✅ 已重建（5 模块） | return 端到端全绿（8 断言） |
+| after_step | ✅ 已重建（5 实例） | return 端到端全绿（9 断言） |
 | after_reasoning | ⏳ 旧版（M1b，偏重） | 待裁剪重建 |
 | after_turn | ⏳ 旧版（M1b，偏重） | 待裁剪重建 |
 
