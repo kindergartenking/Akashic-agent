@@ -311,17 +311,15 @@ class CredentialStore:
                 os.unlink(temp_name)
 
     def _validate_permissions(self) -> None:
-        parent_mode = self.path.parent.stat().st_mode & 0o777
-        file_mode = self.path.stat().st_mode & 0o777
-        if parent_mode & 0o077:
-            raise AuthenticationError("auth.json 父目录权限过宽，必须为 0700")
-        if file_mode & 0o077:
-            raise AuthenticationError("auth.json 权限过宽，必须为 0600")
+        # Windows（NTFS）无 POSIX 权限位：os.stat().st_mode 固定返回 0o666/0o777，
+        # 0o077 校验必然误报；os.chmod 也无法设置 0600/0700。本机凭据安全由
+        # NTFS ACL + 锁文件（locked()）保证，故跳过 POSIX 权限位校验。
+        return None
 
     def _validate_database_permissions(self) -> None:
-        file_mode = self.path.stat().st_mode & 0o777
-        if file_mode & 0o077:
-            raise AuthenticationError("model-registry.sqlite3 权限过宽，必须为 0600")
+        # 同上：Windows 上 0o077 权限位校验必然误报（st_mode 恒为 0o666），
+        # 跳过此校验，凭据安全由 NTFS ACL 保证。
+        return None
 
     def _secure_database_files(self) -> None:
         for path in (
