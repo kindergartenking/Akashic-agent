@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -43,8 +43,12 @@ class LLMClient:
         *,
         system_prompt: str = "",
         tools: list[dict[str, Any]] | None = None,
+        on_delta: Callable[[str], Awaitable[None]] | None = None,
     ) -> LLMResponse:
-        """Run one model step and return text and structured tool calls."""
+        """Run one model step and return text and structured tool calls.
+
+        ``on_delta`` 若提供，在流式读取过程中对每个文本增量回调，实现逐 token 输出。
+        """
 
         if config.provider == "codex":
             return await self._chat_codex(
@@ -52,12 +56,14 @@ class LLMClient:
                 messages,
                 system_prompt=system_prompt,
                 tools=tools or [],
+                on_delta=on_delta,
             )
         return await self._chat_openai_compatible(
             config,
             messages,
             system_prompt=system_prompt,
             tools=tools or [],
+            on_delta=on_delta,
         )
 
     async def _chat_openai_compatible(
@@ -67,6 +73,7 @@ class LLMClient:
         *,
         system_prompt: str,
         tools: list[dict[str, Any]],
+        on_delta: Callable[[str], Awaitable[None]] | None = None,
     ) -> LLMResponse:
         if not config.api_key:
             raise LLMError("未配置模型 API key。请设置 AKASHIC_API_KEY 或完善 model-registry.sqlite3")
@@ -113,6 +120,8 @@ class LLMClient:
                     content = delta.get("content")
                     if isinstance(content, str):
                         content_parts.append(content)
+                        if on_delta is not None and content:
+                            await on_delta(content)
                     raw_calls = delta.get("tool_calls")
                     if not isinstance(raw_calls, list):
                         continue
@@ -236,6 +245,7 @@ class LLMClient:
         *,
         system_prompt: str,
         tools: list[dict[str, Any]],
+        on_delta: Callable[[str], Awaitable[None]] | None = None,
     ) -> LLMResponse:
         if config.registry_path is None or not config.auth_id:
             raise LLMError("Codex 凭据存储未配置")
@@ -248,6 +258,7 @@ class LLMClient:
                 system_prompt=system_prompt,
                 tools=tools,
                 force_refresh=False,
+                on_delta=on_delta,
             )
         except _CodexUnauthorized:
             return await self._chat_codex_once(
@@ -257,6 +268,7 @@ class LLMClient:
                 system_prompt=system_prompt,
                 tools=tools,
                 force_refresh=True,
+                on_delta=on_delta,
             )
 
     async def _chat_codex_once(
@@ -268,6 +280,7 @@ class LLMClient:
         system_prompt: str,
         tools: list[dict[str, Any]],
         force_refresh: bool,
+        on_delta: Callable[[str], Awaitable[None]] | None = None,
     ) -> LLMResponse:
         import asyncio
 
@@ -330,6 +343,8 @@ class LLMClient:
                         delta = event.get("delta")
                         if isinstance(delta, str):
                             content_parts.append(delta)
+                            if on_delta is not None and delta:
+                                await on_delta(delta)
                     elif event_type == "response.output_item.done":
                         item = event.get("item")
                         if isinstance(item, dict) and item.get("type") == "function_call":

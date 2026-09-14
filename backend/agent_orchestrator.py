@@ -66,17 +66,21 @@ class ReactRunner:
         force_final = False
 
         for iteration in range(self._max_iterations):
+            on_delta, stream_state = self._make_stream_emitter(
+                emit, session_id, turn_id, agent_id, emit_answer
+            )
             response = await self._llm.chat(
                 config,
                 messages,
                 system_prompt=system_prompt,
                 tools=[] if force_final else tools.schemas(),
+                on_delta=on_delta,
             )
             if not response.tool_calls:
                 reply = response.content.strip()
                 if not reply:
                     raise RuntimeError("Agent 模型未返回文本或工具调用")
-                if emit_answer:
+                if emit_answer and not stream_state["streamed"]:
                     await self._emit_answer(reply, emit, session_id, turn_id, agent_id)
                 return ReactResult(
                     reply=reply,
@@ -152,14 +156,18 @@ class ReactRunner:
                 "明确说明任何尚未完成的部分，不要再请求工具。"
             ),
         })
+        on_delta, stream_state = self._make_stream_emitter(
+            emit, session_id, turn_id, agent_id, emit_answer
+        )
         final = await self._llm.chat(
             config,
             messages,
             system_prompt=system_prompt,
             tools=[],
+            on_delta=on_delta,
         )
         reply = final.content.strip() or "工具迭代预算已耗尽，模型未生成可用总结。"
-        if emit_answer:
+        if emit_answer and not stream_state["streamed"]:
             await self._emit_answer(reply, emit, session_id, turn_id, agent_id)
         return ReactResult(
             reply=reply,
@@ -213,6 +221,29 @@ class ReactRunner:
             "agent_id": agent_id,
             "delta": content,
         })
+
+    def _make_stream_emitter(
+        self,
+        emit: Emit,
+        session_id: str,
+        turn_id: str,
+        agent_id: str,
+        emit_answer: bool,
+    ) -> tuple[Callable[[str], Awaitable[None]], dict[str, bool]]:
+        """构造 on_delta 回调 + 流式状态，实现「边读边发 answer.delta」。
+
+        工具调用轮 content 为空，on_delta 不触发；最终回复轮 content 逐 token，
+        每次回调发一个 answer.delta。state["streamed"] 标记是否已流式发过，
+        供 chat 返回后判断是否还需兜底发完整 reply。
+        """
+        state = {"streamed": False}
+
+        async def on_delta(delta: str) -> None:
+            state["streamed"] = True
+            if emit_answer:
+                await self._emit_answer(delta, emit, session_id, turn_id, agent_id)
+
+        return on_delta, state
 
 
 class SubAgent:
