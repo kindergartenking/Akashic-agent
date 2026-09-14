@@ -15,7 +15,9 @@ from agent.core.runtime_support import TurnRunResult
 from agent.lifecycle.phase import Phase
 from agent.lifecycle.types import (
     AfterStepCtx,
+    AfterToolResultCtx,
     BeforeStepInput,
+    BeforeToolCallCtx,
     PromptRenderInput,
 )
 from agent.lifecycle.phases.after_step import (
@@ -149,11 +151,35 @@ class Reasoner:
                     arguments = call.get("arguments", {})
                     if not isinstance(arguments, dict):
                         arguments = {}
+                    # 工具调用前广播（TAP）：@on_tool_call 观察者在此触发，只读不阻塞。
+                    await self._bus.fanout(
+                        BeforeToolCallCtx(
+                            session_key=session.key,
+                            channel=msg.channel,
+                            chat_id=msg.chat_id,
+                            tool_name=name,
+                            arguments=arguments,
+                        )
+                    )
                     result = await self._tools.execute(name, arguments)
                     result_text = (
                         result.text
                         if isinstance(result, ToolResult)
                         else str(result)
+                    )
+                    # 工具调用后广播（TAP）：@on_tool_result 观察者在此触发。
+                    # status 恒为 success——execute 是 fail-soft，错误已转成字符串返回；
+                    # 失败态细分待 ToolExecutor 接线后细化。
+                    await self._bus.fanout(
+                        AfterToolResultCtx(
+                            session_key=session.key,
+                            channel=msg.channel,
+                            chat_id=msg.chat_id,
+                            tool_name=name,
+                            arguments=arguments,
+                            result=result_text,
+                            status="success",
+                        )
                     )
                     called_names.append(name)
                     tools_used.append(name)

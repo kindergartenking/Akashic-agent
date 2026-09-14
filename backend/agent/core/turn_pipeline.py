@@ -50,6 +50,8 @@ class TurnPipeline:
         outbound: OutboundPort,
         session_services: Any,
         reasoner: Any,
+        before_turn_plugin_modules: list[Any] | None = None,
+        after_reasoning_plugin_modules: list[Any] | None = None,
     ) -> None:
         self._bus = bus
         self._session_manager = session_manager
@@ -59,8 +61,14 @@ class TurnPipeline:
         self._session_services = session_services
         self._reasoner = reasoner
 
+        # 插件模块通过 plugin_modules 注入到模块链，topo_sort 会按 slot/requires
+        # 把它们排到正确位置（插件模块排在同依赖的 builtin 之前）。
         self._before_turn = Phase(
-            default_before_turn_modules(self._bus, self._session_manager),
+            default_before_turn_modules(
+                self._bus,
+                self._session_manager,
+                plugin_modules=before_turn_plugin_modules,
+            ),
             frame_factory=lambda state: BeforeTurnFrame(input=state),
         )
         self._before_reasoning = Phase(
@@ -70,7 +78,11 @@ class TurnPipeline:
             frame_factory=lambda input: BeforeReasoningFrame(input=input),
         )
         self._after_reasoning = Phase(
-            default_after_reasoning_modules(self._bus, self._session_services),
+            default_after_reasoning_modules(
+                self._bus,
+                self._session_services,
+                plugin_modules=after_reasoning_plugin_modules,
+            ),
             frame_factory=lambda input: AfterReasoningFrame(input=input),
         )
         self._after_turn = Phase(
