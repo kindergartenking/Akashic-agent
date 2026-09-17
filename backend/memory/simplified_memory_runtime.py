@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -31,6 +32,8 @@ class SimplifiedMemoryRuntime:
         self._mem = SimplifiedMemory(db_path=db_path)
         self._provider = WorkspaceEmbeddingProvider(workspace, http)
         self._sessions = sessions
+        self._log_path = Path(workspace) / "memory" / "recall.log"
+        self._log_path.parent.mkdir(parents=True, exist_ok=True)
 
     async def recall(
         self,
@@ -50,7 +53,7 @@ class SimplifiedMemoryRuntime:
         for tid, score in results:
             lines.append(f"- {self._mem.turns[tid]['user_text']}")
         context_block = "以下是与你当前问题相关的历史记忆（情景召回）：\n" + "\n".join(lines)
-        print(f"[简化记忆·召回] query={text!r} 召回 {len(results)} 条：\n{context_block}", flush=True)
+        self._log(f"[简化记忆·召回] query={text!r} 召回 {len(results)} 条：\n{context_block}")
         return SimpleNamespace(context_block=context_block, ticket=None)
 
     async def commit_turn(
@@ -79,7 +82,7 @@ class SimplifiedMemoryRuntime:
         )
         if user_emb is not None:
             hub = self._mem.add_turn(user_text, user_emb, assistant_text, assistant_emb)
-            print(f"[简化记忆·落库] turn={turn_id} 已写入，建 hub={hub}", flush=True)
+            self._log(f"[简化记忆·落库] turn={turn_id} 已写入，建 hub={hub}")
         return SimpleNamespace(turn_id=turn_id)
 
     async def _one_embedding(self, text: str) -> np.ndarray | None:
@@ -88,6 +91,15 @@ class SimplifiedMemoryRuntime:
             return np.array(vectors[0]) if vectors else None
         except Exception:
             return None
+
+    def _log(self, message: str) -> None:
+        """召回/落库日志：同时打到 stdout（后台任务可见）并落盘到 recall.log。"""
+        print(message, flush=True)
+        try:
+            with open(self._log_path, "a", encoding="utf-8") as handle:
+                handle.write(f"[{datetime.now().isoformat(timespec='seconds')}] {message}\n")
+        except Exception:
+            logger.exception("写召回日志失败")
 
     async def aclose(self) -> None:
         """内存版无持久化资源，关闭为 no-op（对齐 AkashaMemoryRuntime.aclose）。"""
