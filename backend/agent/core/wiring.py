@@ -39,7 +39,9 @@ def build_wiring(
     outbound: OutboundPort | None = None,
     max_iterations: int = 10,
     before_turn_plugin_modules: list[Any] | None = None,
+    before_reasoning_plugin_modules: list[Any] | None = None,
     after_reasoning_plugin_modules: list[Any] | None = None,
+    after_turn_plugin_modules: list[Any] | None = None,
 ) -> Wiring:
     bus = EventBus()
     session_manager = SessionManager()
@@ -63,7 +65,9 @@ def build_wiring(
         session_services=session_services,
         reasoner=reasoner,
         before_turn_plugin_modules=before_turn_plugin_modules,
+        before_reasoning_plugin_modules=before_reasoning_plugin_modules,
         after_reasoning_plugin_modules=after_reasoning_plugin_modules,
+        after_turn_plugin_modules=after_turn_plugin_modules,
     )
     return Wiring(
         bus=bus,

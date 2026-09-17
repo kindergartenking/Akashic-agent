@@ -51,7 +51,9 @@ class TurnPipeline:
         session_services: Any,
         reasoner: Any,
         before_turn_plugin_modules: list[Any] | None = None,
+        before_reasoning_plugin_modules: list[Any] | None = None,
         after_reasoning_plugin_modules: list[Any] | None = None,
+        after_turn_plugin_modules: list[Any] | None = None,
     ) -> None:
         self._bus = bus
         self._session_manager = session_manager
@@ -73,7 +75,10 @@ class TurnPipeline:
         )
         self._before_reasoning = Phase(
             default_before_reasoning_modules(
-                self._bus, self._tools, self._session_manager
+                self._bus,
+                self._tools,
+                self._session_manager,
+                plugin_modules=before_reasoning_plugin_modules,
             ),
             frame_factory=lambda input: BeforeReasoningFrame(input=input),
         )
@@ -86,7 +91,11 @@ class TurnPipeline:
             frame_factory=lambda input: AfterReasoningFrame(input=input),
         )
         self._after_turn = Phase(
-            default_after_turn_modules(self._bus, self._outbound),
+            default_after_turn_modules(
+                self._bus,
+                self._outbound,
+                plugin_modules=after_turn_plugin_modules,
+            ),
             frame_factory=lambda input: AfterTurnFrame(input=input),
         )
 

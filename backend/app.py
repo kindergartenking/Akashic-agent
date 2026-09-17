@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 import time
+import tomllib
 from contextlib import asynccontextmanager
 from pathlib import Path
 from uuid import uuid4
@@ -23,11 +24,14 @@ from fastapi.staticfiles import StaticFiles
 from .llm_client import LLMClient
 from .agent_orchestrator import AgentOrchestrator
 from .message_bus import BusMessage, MessageBus
+from .channels.qq_adapter import QQAdapter
 from .model_config import ModelConfigResolver
 from .settings_api import create_settings_router, settings_security_middleware
 from .session_store import SessionStore
 from .context_manager import SessionContextManager
 from .memory import AkashaMemoryRuntime
+from .memory.simplified_memory_runtime import SimplifiedMemoryRuntime
+from .memory.long_term_memory import LongTermMemory, LongTermMemoryStore
 from .tools import (
     ListDirTool,
     ReadFileTool,
@@ -56,6 +60,18 @@ DASHBOARD_STATIC_ROOT = STATIC_ROOT / "dashboard"
 logger = logging.getLogger(__name__)
 
 
+def _load_toml_config() -> dict:
+    """读取项目根目录的 config.toml，失败返回空字典。"""
+    path = WORKSPACE / "config.toml"
+    if not path.exists():
+        return {}
+    try:
+        with open(path, "rb") as handle:
+            return tomllib.load(handle)
+    except Exception:
+        return {}
+
+
 class Runtime:
     def __init__(self) -> None:
         self.http: httpx.AsyncClient | None = None
@@ -68,17 +84,25 @@ class Runtime:
         self.turns: dict[tuple[int, str], asyncio.Task[None]] = {}
         self.sessions = SessionStore(WORKSPACE / "sessions.db")
         self.context_manager: SessionContextManager | None = None
-        self.memory: AkashaMemoryRuntime | None = None
+        self.memory: AkashaMemoryRuntime | SimplifiedMemoryRuntime | None = None
+        self.long_term: LongTermMemory | None = None
+        self._consolidate_task: asyncio.Task[None] | None = None
+        self.qq_adapter: QQAdapter | None = None
 
     async def start(self) -> None:
         self.http = httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0))
         self.llm = LLMClient(self.http)
         self.context_manager = SessionContextManager(self.sessions, self.llm)
-        # Akasha is owned directly by Runtime for now.  This replaces the
-        # original project's Plugin -> EventBus wiring without changing its
-        # canonical-source/read-before-write memory contract.
-        self.memory = AkashaMemoryRuntime(self.sessions, WORKSPACE, self.http)
-        await self.memory.start_or_rebuild()
+        # 记忆后端：默认用简化记忆架构（去时间边+去边权演化）；AKASHIC_MEMORY_BACKEND=akasha
+        # 切回原版 Akasha。两者实现相同的 recall/commit_turn 契约。
+        memory_backend = os.getenv("AKASHIC_MEMORY_BACKEND", "simplified").strip().lower()
+        if memory_backend == "akasha":
+            self.memory = AkashaMemoryRuntime(self.sessions, WORKSPACE, self.http)
+            await self.memory.start_or_rebuild()
+        else:
+            self.memory = SimplifiedMemoryRuntime(self.sessions, WORKSPACE, self.http)
+        # 长期记忆（MEMORY.md 层）：提炼 → PENDING → 审计合并，与情景记忆并行
+        self.long_term = LongTermMemory(LongTermMemoryStore(WORKSPACE / "memory"), self.llm)
         self.tools = ToolRegistry(execution_timeout=30.0)
         self.tools.register(ReadFileTool(WORKSPACE))
         self.tools.register(ListDirTool(WORKSPACE))
@@ -97,8 +121,50 @@ class Runtime:
         self.tools.register(ShellTaskStopTool(self.shell.manager))
         self.agent = AgentOrchestrator(self.llm, self.tools, self.spawn_manager)
         await self.bus.start(self.handle_message)
+        self._consolidate_task = asyncio.create_task(self._consolidate_loop())
+        await self._start_qq_channel()
+
+    async def _start_qq_channel(self) -> None:
+        """按 config.toml 的 [qq] 配置启动 QQ 渠道（OneBot WebSocket）。"""
+        cfg = _load_toml_config().get("qq", {})
+        if not cfg.get("enabled", False):
+            return
+        ws_url = str(cfg.get("ws_url", "")).strip()
+        if not ws_url:
+            return
+        self.qq_adapter = QQAdapter(
+            ws_url,
+            self.bus,
+            sessions=self.sessions,
+            allow_from=[str(x) for x in cfg.get("allow_from", [])],
+            groups=[str(x) for x in cfg.get("groups", [])],
+            runtime_id=str(cfg.get("runtime_id", "")).strip() or None,
+        )
+        try:
+            await self.qq_adapter.start()
+        except Exception as exc:
+            print(f"[qq] QQ 渠道启动失败: {exc}", flush=True)
+            logger.exception("[qq] QQ 渠道启动失败")
+            self.qq_adapter = None
+
+    async def _consolidate_loop(self) -> None:
+        """长期记忆审计合并：每 2 小时自动把 PENDING 合并进 MEMORY.md。"""
+        while True:
+            await asyncio.sleep(2 * 3600)
+            try:
+                config = ModelConfigResolver(WORKSPACE).resolve(None)
+                if config is not None and self.long_term is not None:
+                    updated = await self.long_term.consolidate(config)
+                    if updated:
+                        logger.info("[长期记忆] 审计合并完成，PENDING 已并入 MEMORY.md")
+            except Exception:
+                logger.exception("[长期记忆] 审计合并失败")
 
     async def stop(self) -> None:
+        if self._consolidate_task is not None:
+            self._consolidate_task.cancel()
+        if self.qq_adapter is not None:
+            await self.qq_adapter.stop()
         for task in self.turns.values():
             task.cancel()
         await self.bus.stop()
@@ -147,6 +213,14 @@ class Runtime:
                     # The sidecar is derived state.  A recall outage must not
                     # prevent the canonical chat turn from completing.
                     logger.exception("Akasha recall failed; continuing without memory")
+            # 长期记忆（MEMORY.md 关于用户的稳定事实）注入 system
+            if self.long_term is not None:
+                lt = self.long_term.get_context()
+                if lt.strip():
+                    history = [
+                        {"role": "system", "content": "长期记忆（关于用户的稳定事实）：\n" + lt},
+                        *history,
+                    ]
             result = await self.agent.run(
                 config,
                 message.text,
@@ -184,6 +258,14 @@ class Runtime:
                     # The source turn has already committed.  On the next
                     # startup Akasha rebuilds its sidecar from sessions.db.
                     logger.exception("Akasha commit failed; source turn remains recoverable")
+            # 长期记忆提炼：从本轮对话提取 pending_items 进 PENDING.md
+            if self.long_term is not None:
+                try:
+                    added = await self.long_term.extract_pending(config, message.text, content)
+                    if added:
+                        logger.info("[长期记忆] 提炼 %d 条 pending 候选", added)
+                except Exception:
+                    logger.exception("[长期记忆] 提炼失败")
             await message.emit({"type": "turn.output.completed", "session_id": message.session_id, "turn_id": message.turn_id})
             await message.emit({
                 "type": "message.final", "session_id": message.session_id, "turn_id": message.turn_id,

@@ -10,3 +10,12 @@ engine = "akasha"
 
 [memory.embedding]
 model_ref = "embedding-f22f23d4294744f1a7ccced6bd995291__b4fe900b8c"
+
+[qq]
+# QQ 渠道（OneBot 正向 WebSocket，连接 NapCat）
+enabled = true                       # true 才启动 QQ 渠道
+ws_url = "ws://127.0.0.1:3001"       # NapCat 的正向 WebSocket 地址
+runtime_id = ""                       # 可选的模型 runtime_id，空则用默认
+allow_from = []                       # 允许交互的 QQ 号白名单，空 = 允许所有人
+groups = []                           # 允许响应的群号，空 = 所有群
+
