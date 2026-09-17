@@ -30,6 +30,7 @@ from ..message_bus import BusMessage, MessageBus
 logger = logging.getLogger(__name__)
 
 _GROUP_PREFIX = "gqq:"
+_RETRY_DELAY = 5.0  # 断线后重连间隔（秒）
 
 
 class QQAdapter:
@@ -58,26 +59,59 @@ class QQAdapter:
     # ── 生命周期 ─────────────────────────────────────────────
 
     async def start(self) -> None:
-        import websockets
+        """启动后台任务：连接 + 接收 + 断线自动重连。
 
-        self._ws = await websockets.connect(self._ws_url)
-        self._recv_task = asyncio.create_task(self._recv_loop())
-        print(f"[qq] 已连接 OneBot WebSocket: {self._ws_url}", flush=True)
+        不阻塞等待首次连接；NapCat 未启动或中途掉线时会在后台按
+        ``_RETRY_DELAY`` 无限重连，因此无需重启后端即可恢复。
+        """
+        self._recv_task = asyncio.create_task(self._run())
 
     async def stop(self) -> None:
-        if self._recv_task is not None:
-            self._recv_task.cancel()
-            self._recv_task = None
-        if self._ws is not None:
-            await self._ws.close()
-            self._ws = None
+        task, self._recv_task = self._recv_task, None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        await self._close_ws()
         logger.info("[qq] QQAdapter 已停止")
+
+    async def _close_ws(self) -> None:
+        """幂等地关闭当前 WebSocket（取走引用并置 None）。"""
+        ws, self._ws = self._ws, None
+        if ws is not None:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+
+    async def _run(self) -> None:
+        """连接 + 接收主循环，断线自动重连，直到被 stop() 取消。"""
+        import websockets
+
+        while True:
+            try:
+                self._ws = await websockets.connect(self._ws_url)
+                print(f"[qq] 已连接 OneBot WebSocket: {self._ws_url}", flush=True)
+                await self._recv_loop()
+            except asyncio.CancelledError:
+                await self._close_ws()
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "[qq] WebSocket 连接断开：%s，%.0f 秒后重连",
+                    exc,
+                    _RETRY_DELAY,
+                )
+                await self._close_ws()
+                await asyncio.sleep(_RETRY_DELAY)
 
     # ── 入站（OneBot 事件 → BusMessage）──────────────────────
 
     async def _recv_loop(self) -> None:
         while True:
-            raw = await self._ws.recv()
+            raw = await self._ws.recv()  # 仅此处的连接异常会触发外层重连
             try:
                 event = json.loads(raw)
             except json.JSONDecodeError:
@@ -85,7 +119,11 @@ class QQAdapter:
             if not isinstance(event, dict):
                 continue
             if event.get("post_type") == "message":
-                await self._handle_message_event(event)
+                try:
+                    await self._handle_message_event(event)
+                except Exception:
+                    # 单条消息处理失败不应影响连接，仅记录并继续收下一条。
+                    logger.exception("[qq] 处理消息事件失败")
 
     async def _handle_message_event(self, event: dict) -> None:
         message_type = str(event.get("message_type") or "")
