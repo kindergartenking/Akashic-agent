@@ -40,7 +40,8 @@ class SessionStore:
                     updated_at TEXT NOT NULL,
                     last_consolidated INTEGER NOT NULL DEFAULT 0,
                     metadata TEXT NOT NULL DEFAULT '{}',
-                    user_id TEXT NOT NULL DEFAULT 'local'
+                    user_id TEXT NOT NULL DEFAULT 'local',
+                    channel TEXT NOT NULL DEFAULT 'web'
                 );
                 CREATE TABLE IF NOT EXISTS turns (
                     id TEXT PRIMARY KEY,
@@ -82,6 +83,18 @@ class SessionStore:
                 connection.execute(
                     "ALTER TABLE sessions ADD COLUMN user_id TEXT NOT NULL DEFAULT 'local'"
                 )
+            if "channel" not in columns:
+                connection.execute(
+                    "ALTER TABLE sessions ADD COLUMN channel TEXT NOT NULL DEFAULT 'web'"
+                )
+                # 回填：老数据里已在 metadata 标记非 web 渠道的 session，同步到独立列，
+                # 否则第三方（QQ 等）会话会带着默认 'web' 继续显示在网页端。
+                connection.execute(
+                    """
+                    UPDATE sessions SET channel = 'qq'
+                    WHERE json_extract(metadata, '$.channel') = 'qq'
+                    """
+                )
             message_columns = {
                 str(row[1])
                 for row in connection.execute("PRAGMA table_info(messages)")
@@ -118,6 +131,7 @@ class SessionStore:
         *,
         user_id: str = "local",
         metadata: dict[str, Any] | None = None,
+        channel: str = "web",
     ) -> str:
         """Atomically admit a session, queued turn and user message.
 
@@ -132,18 +146,19 @@ class SessionStore:
         now = self._now()
         message_id = f"msg-{uuid4().hex}"
         metadata_payload = dict(metadata or {})
-        metadata_payload.setdefault("channel", "web")
+        metadata_payload.setdefault("channel", channel)
         metadata_payload.setdefault("user_id", user_id or "local")
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 """
-                INSERT INTO sessions(key, created_at, updated_at, metadata, user_id)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO sessions(key, created_at, updated_at, metadata, user_id, channel)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(key) DO UPDATE SET
                     updated_at = excluded.updated_at,
                     metadata = excluded.metadata,
-                    user_id = excluded.user_id
+                    user_id = excluded.user_id,
+                    channel = excluded.channel
                 """,
                 (
                     session_id,
@@ -151,6 +166,7 @@ class SessionStore:
                     now,
                     json.dumps(metadata_payload, ensure_ascii=False, separators=(",", ":")),
                     user_id or "local",
+                    channel,
                 ),
             )
             existing = connection.execute(
@@ -291,23 +307,37 @@ class SessionStore:
             )
             connection.commit()
 
-    def list_sessions(self, *, page: int = 1, page_size: int = 80) -> dict[str, Any]:
+    def list_sessions(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 80,
+        channel: str | None = "web",
+    ) -> dict[str, Any]:
         page = max(1, page)
         page_size = max(1, min(page_size, 200))
+        # 默认只返回 web 渠道会话；channel=None 时返回全部（含 QQ 等第三方）。
+        where = "" if channel is None else "WHERE s.channel = ?"
+        filter_params: list[Any] = [] if channel is None else [channel]
         with closing(self._connect()) as connection:
-            total = int(connection.execute("SELECT COUNT(*) FROM sessions").fetchone()[0])
+            total = int(
+                connection.execute(
+                    f"SELECT COUNT(*) FROM sessions s {where}", tuple(filter_params)
+                ).fetchone()[0]
+            )
             rows = connection.execute(
-                """
-                SELECT s.key, s.created_at, s.updated_at, s.user_id,
+                f"""
+                SELECT s.key, s.created_at, s.updated_at, s.user_id, s.channel,
                        COUNT(m.id) AS message_count,
                        (SELECT content FROM messages first_m
                         WHERE first_m.session_key = s.key AND first_m.role = 'user'
                         ORDER BY first_m.seq LIMIT 1) AS first_message_content
                 FROM sessions s LEFT JOIN messages m ON m.session_key = s.key
+                {where}
                 GROUP BY s.key ORDER BY s.updated_at DESC, s.key DESC
                 LIMIT ? OFFSET ?
                 """,
-                (page_size, (page - 1) * page_size),
+                tuple(filter_params + [page_size, (page - 1) * page_size]),
             ).fetchall()
         return {
             "items": [dict(row) for row in rows],

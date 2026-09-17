@@ -122,7 +122,8 @@ class QQAdapter:
                 turn_id,
                 raw_message,
                 user_id=user_id,
-                metadata={"channel": "qq", "chat_type": message_type},
+                metadata={"chat_type": message_type},
+                channel="qq",
             )
 
         message = BusMessage(
